@@ -3,6 +3,7 @@ package core
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
 )
 
 // RPCRequest represents an incoming JSON-RPC call.
@@ -426,25 +427,64 @@ func (c *Core) dispatch(method string, params json.RawMessage) (interface{}, err
 	}
 }
 
-// fetchContent fetches content from a Tidal URL (track, album, playlist, artist).
+// fetchContent fetches content from a Tidal URL via HiFi proxy (same as desktop).
 func (c *Core) fetchContent(rawURL string) (interface{}, error) {
 	id, contentType, err := ParseTidalURL(rawURL)
 	if err != nil {
 		return nil, err
 	}
 
+	result := map[string]interface{}{
+		"type": contentType,
+		"id":   id,
+	}
+
 	switch contentType {
 	case "track":
-		return c.tidalClient.GetTrack(id)
+		trackID, convErr := strconv.Atoi(id)
+		if convErr != nil {
+			return nil, fmt.Errorf("invalid track ID: %s", id)
+		}
+		track, err := c.downloader.GetTrackAsTidalTrack(trackID)
+		if err != nil {
+			return nil, err
+		}
+		result["title"] = track.Title
+		result["creator"] = track.Artist
+		result["coverUrl"] = track.CoverURL
+		result["tracks"] = []TidalTrack{*track}
+		result["trackCount"] = 1
+
 	case "album":
-		return c.tidalClient.GetAlbum(id)
+		album, err := c.downloader.GetAlbumFromProxy(id)
+		if err != nil {
+			return nil, err
+		}
+		result["title"] = album.Title
+		result["creator"] = album.Artist
+		result["coverUrl"] = album.CoverURL
+		result["tracks"] = album.Tracks
+		result["trackCount"] = len(album.Tracks)
+
 	case "playlist":
-		return c.tidalClient.GetPlaylist(id)
+		playlist, err := c.downloader.GetPlaylistFromProxy(id)
+		if err != nil {
+			return nil, err
+		}
+		result["title"] = playlist.Title
+		result["creator"] = playlist.Creator
+		result["coverUrl"] = playlist.CoverURL
+		result["tracks"] = playlist.Tracks
+		result["trackCount"] = len(playlist.Tracks)
+
 	case "artist":
 		return c.tidalClient.GetArtistDiscography(id)
+
 	default:
 		return nil, fmt.Errorf("unsupported content type: %s", contentType)
 	}
+
+	return result, nil
 }
 
 // marshalResult serializes a successful response.
