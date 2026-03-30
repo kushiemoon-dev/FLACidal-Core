@@ -27,7 +27,10 @@ const (
 // defaultTidalHifiEndpoints is the built-in list of Tidal HiFi proxy endpoints.
 // Users can extend this via TidalHifiEndpoints in config.
 var defaultTidalHifiEndpoints = []string{
+	"https://hifi-one.spotisaver.net",
+	"https://hifi-two.spotisaver.net",
 	"https://vogel.qqdl.site",
+	"https://triton.squid.wtf",
 }
 
 // defaultMetadataEndpoints are hifi-api v2.4 proxy endpoints that support
@@ -49,12 +52,34 @@ type endpointEntry struct {
 
 // TidalHifiService implements FLAC downloading via a pool of proxy endpoints
 type TidalHifiService struct {
-	client         *http.Client
-	downloadClient *http.Client // Separate client for downloads (no timeout)
-	endpoints      []*endpointEntry
-	endpointMu     sync.Mutex
-	options        DownloadOptions
-	logger         *LogBuffer // optional — set via SetLogger
+	client           *http.Client
+	downloadClient   *http.Client // Separate client for downloads (no timeout)
+	endpoints        []*endpointEntry
+	endpointMu       sync.Mutex
+	options          DownloadOptions
+	logger           *LogBuffer // optional — set via SetLogger
+	downloadProgress func(written, total int64) // optional byte-level progress callback
+}
+
+// downloadProgressWriter wraps an io.Writer and reports byte-level progress during downloads.
+type downloadProgressWriter struct {
+	writer     io.Writer
+	total      int64
+	written    int64
+	onProgress func(written, total int64)
+	lastReport time.Time
+}
+
+func (pw *downloadProgressWriter) Write(p []byte) (int, error) {
+	n, err := pw.writer.Write(p)
+	pw.written += int64(n)
+	if time.Since(pw.lastReport) > 250*time.Millisecond {
+		pw.lastReport = time.Now()
+		if pw.onProgress != nil {
+			pw.onProgress(pw.written, pw.total)
+		}
+	}
+	return n, err
 }
 
 // TidalManifest represents the decoded manifest from hifi-api
@@ -140,6 +165,9 @@ type DownloadResult struct {
 	Error            string          `json:"error,omitempty"`
 	Analysis         *AnalysisResult `json:"analysis,omitempty"` // Auto-analysis result if enabled
 	Source           string          `json:"source,omitempty"`   // Which source served this track (e.g. "tidal", "qobuz")
+	BytesDownloaded  int64           `json:"bytesDownloaded,omitempty"` // Bytes downloaded so far (progress)
+	BytesTotal       int64           `json:"bytesTotal,omitempty"`      // Total bytes expected
+	Speed            int64           `json:"speed,omitempty"`           // Download speed in bytes/sec
 }
 
 // DownloadOptions configures download behavior
@@ -1238,10 +1266,25 @@ func (t *TidalHifiService) downloadFile(downloadURL, outputPath string) error {
 	}
 	defer outFile.Close()
 
-	_, err = io.Copy(outFile, resp.Body)
+	var dst io.Writer = outFile
+	if t.downloadProgress != nil {
+		dst = &downloadProgressWriter{
+			writer:     outFile,
+			total:      resp.ContentLength,
+			onProgress: t.downloadProgress,
+			lastReport: time.Now(),
+		}
+	}
+
+	_, err = io.Copy(dst, resp.Body)
 	if err != nil {
 		os.Remove(outputPath) // Clean up partial file
 		return fmt.Errorf("download interrupted: %w", err)
+	}
+
+	// Final progress report so UI reaches 100%
+	if t.downloadProgress != nil && resp.ContentLength > 0 {
+		t.downloadProgress(resp.ContentLength, resp.ContentLength)
 	}
 
 	return nil

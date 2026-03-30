@@ -2,11 +2,13 @@ package core
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 )
 
 // m3u8Entry holds data for one line in a generated M3U8 playlist.
@@ -57,6 +59,7 @@ type DownloadJob struct {
 	Error      string             `json:"error,omitempty"`     // Error message if download failed
 	Copyright  string             `json:"copyright,omitempty"` // Copyright string to embed in tags
 	Label      string             `json:"label,omitempty"`     // Record label to embed in tags
+	Quality    string             `json:"quality,omitempty"`   // Per-track quality override (empty = use global)
 	ctx        context.Context    // For cancellation
 	cancelFunc context.CancelFunc // Cancel function
 }
@@ -192,7 +195,7 @@ func (dm *DownloadManager) processJob(job *DownloadJob) {
 		select {
 		case <-job.ctx.Done():
 			if dm.onProgress != nil {
-				dm.onProgress(job.TrackID, "cancelled", nil)
+				dm.onProgress(job.TrackID, "cancelled", &DownloadResult{TrackID: job.TrackID, Title: job.Title, Artist: job.Artist})
 			}
 			return
 		default:
@@ -201,7 +204,7 @@ func (dm *DownloadManager) processJob(job *DownloadJob) {
 
 	// Notify start
 	if dm.onProgress != nil {
-		dm.onProgress(job.TrackID, "downloading", nil)
+		dm.onProgress(job.TrackID, "downloading", &DownloadResult{TrackID: job.TrackID, Title: job.Title, Artist: job.Artist})
 	}
 
 	// Mark as active
@@ -211,10 +214,51 @@ func (dm *DownloadManager) processJob(job *DownloadJob) {
 	delete(dm.failedJobs, job.TrackID)
 	dm.mu.Unlock()
 
+	// Set byte-level progress callback for this download
+	var downloadStart time.Time
+	dm.service.downloadProgress = func(written, total int64) {
+		if dm.onProgress == nil {
+			return
+		}
+		var speed int64
+		elapsed := time.Since(downloadStart).Seconds()
+		if elapsed > 0 {
+			speed = int64(float64(written) / elapsed)
+		}
+		dm.onProgress(job.TrackID, "downloading", &DownloadResult{
+			TrackID:        job.TrackID,
+			Title:          job.Title,
+			Artist:         job.Artist,
+			BytesDownloaded: written,
+			BytesTotal:     total,
+			Speed:          speed,
+		})
+	}
+	downloadStart = time.Now()
+
+	// Per-track quality override
+	var savedQuality string
+	if job.Quality != "" {
+		opts := dm.service.GetOptions()
+		savedQuality = opts.Quality
+		opts.Quality = job.Quality
+		dm.service.SetOptions(opts)
+	}
+
 	// Download — try primary (Tidal) first, then fallback sources
 	result, err := dm.service.DownloadTrack(job.TrackID, job.OutputDir, job.Copyright, job.Label)
 	if (err != nil || (result != nil && !result.Success)) && dm.qobuzFallbackEnabled() && job.ISRC != "" {
 		result, err = dm.downloadViaQobuzFallback(job, result)
+	}
+
+	// Clear byte-level progress callback
+	dm.service.downloadProgress = nil
+
+	// Restore quality if overridden
+	if savedQuality != "" {
+		opts := dm.service.GetOptions()
+		opts.Quality = savedQuality
+		dm.service.SetOptions(opts)
 	}
 
 	// Check for cancellation after download
@@ -235,22 +279,36 @@ func (dm *DownloadManager) processJob(job *DownloadJob) {
 	// Handle result
 	if cancelled {
 		if dm.onProgress != nil {
-			dm.onProgress(job.TrackID, "cancelled", nil)
+			dm.onProgress(job.TrackID, "cancelled", &DownloadResult{TrackID: job.TrackID, Title: job.Title, Artist: job.Artist})
 		}
 	} else if err != nil || !result.Success {
 		// Capture error message for export
+		errMsg := ""
 		if result != nil && result.Error != "" {
+			errMsg = result.Error
 			job.Error = result.Error
 		} else if err != nil {
-			job.Error = err.Error()
+			errMsg = err.Error()
+			job.Error = errMsg
 		}
 		// Track failed job for retry
 		dm.mu.Lock()
 		dm.failedJobs[job.TrackID] = job
 		dm.mu.Unlock()
 
+		// Always include title/artist in error result for UI display
+		errResult := &DownloadResult{TrackID: job.TrackID, Title: job.Title, Artist: job.Artist, Error: errMsg}
+		if result != nil {
+			errResult.Success = false
+			if result.Title != "" {
+				errResult.Title = result.Title
+			}
+			if result.Artist != "" {
+				errResult.Artist = result.Artist
+			}
+		}
 		if dm.onProgress != nil {
-			dm.onProgress(job.TrackID, "error", result)
+			dm.onProgress(job.TrackID, "error", errResult)
 		}
 	} else if dm.onProgress != nil {
 		dm.onProgress(job.TrackID, "completed", result)
@@ -415,7 +473,41 @@ func (dm *DownloadManager) queueDownloadFull(trackID int, outputDir, title, arti
 
 	// Notify queued only after successfully added
 	if dm.onProgress != nil {
-		dm.onProgress(trackID, "queued", nil)
+		dm.onProgress(trackID, "queued", &DownloadResult{TrackID: trackID, Title: title, Artist: artist})
+	}
+
+	return nil
+}
+
+// queueDownloadFullWithQuality queues a single track with a per-track quality override.
+func (dm *DownloadManager) queueDownloadFullWithQuality(trackID int, outputDir, title, artist, isrc string, duration int, copyright, label, quality string) error {
+	dm.mu.RLock()
+	if !dm.running {
+		dm.mu.RUnlock()
+		return fmt.Errorf("download manager not running")
+	}
+	dm.mu.RUnlock()
+
+	ctx, cancelFunc := context.WithCancel(context.Background())
+
+	job := &DownloadJob{
+		TrackID:    trackID,
+		OutputDir:  outputDir,
+		Title:      title,
+		Artist:     artist,
+		ISRC:       isrc,
+		Duration:   duration,
+		Copyright:  copyright,
+		Label:      label,
+		Quality:    quality,
+		ctx:        ctx,
+		cancelFunc: cancelFunc,
+	}
+
+	dm.queue <- job
+
+	if dm.onProgress != nil {
+		dm.onProgress(trackID, "queued", &DownloadResult{TrackID: trackID, Title: title, Artist: artist})
 	}
 
 	return nil
@@ -560,4 +652,50 @@ func (dm *DownloadManager) IsPaused() bool {
 	dm.mu.RLock()
 	defer dm.mu.RUnlock()
 	return dm.paused
+}
+
+// PersistQueue serializes failed jobs to a JSON file for resume on restart.
+func (dm *DownloadManager) PersistQueue(path string) error {
+	dm.mu.RLock()
+	defer dm.mu.RUnlock()
+
+	var jobs []*DownloadJob
+	for _, job := range dm.failedJobs {
+		jobs = append(jobs, job)
+	}
+
+	if len(jobs) == 0 {
+		// Nothing to persist; remove stale file if present
+		os.Remove(path)
+		return nil
+	}
+
+	data, err := json.MarshalIndent(jobs, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0644)
+}
+
+// RestoreQueue loads previously persisted jobs and re-queues them.
+func (dm *DownloadManager) RestoreQueue(path string) (int, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, nil // No saved queue, not an error
+	}
+
+	var jobs []*DownloadJob
+	if err := json.Unmarshal(data, &jobs); err != nil {
+		return 0, err
+	}
+
+	restored := 0
+	for _, job := range jobs {
+		if err := dm.QueueDownload(job.TrackID, job.OutputDir, job.Title, job.Artist); err == nil {
+			restored++
+		}
+	}
+
+	os.Remove(path) // Clean up after restoring
+	return restored, nil
 }
