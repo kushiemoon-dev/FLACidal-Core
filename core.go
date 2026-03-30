@@ -16,9 +16,10 @@ type Core struct {
 	downloader      *TidalHifiService
 	downloadManager *DownloadManager
 	logBuffer       *LogBuffer
-	sourceManager   *SourceManager
-	tidalSource     *TidalSource
-	qobuzSource     *QobuzSource
+	sourceManager    *SourceManager
+	tidalSource      *TidalSource
+	qobuzSource      *QobuzSource
+	extensionManager *ExtensionManager
 	trackContentMap sync.Map // maps trackID (int) → contentID (string) for history tracking
 
 	// EventCallback is called when async events occur (download progress, etc.)
@@ -121,6 +122,9 @@ func NewCore(dataDir string) (*Core, error) {
 	c.sourceManager.RegisterSource(c.qobuzSource)
 	c.sourceManager.SetPreferredSource(config.PreferredSource)
 
+	// Initialize extension manager
+	c.extensionManager = NewExtensionManager(GetDataDir(), c.logBuffer)
+
 	c.logBuffer.Success("FLACidal core initialized")
 	return c, nil
 }
@@ -132,11 +136,17 @@ func (c *Core) SetEventCallback(cb func(event Event)) {
 
 	// Wire download progress to event system
 	c.downloadManager.SetProgressCallback(func(trackID int, status string, result *DownloadResult) {
-		c.emitEvent("download-progress", map[string]interface{}{
+		payload := map[string]interface{}{
 			"trackId": trackID,
 			"status":  status,
 			"result":  result,
-		})
+		}
+		if result != nil {
+			payload["bytesDownloaded"] = result.BytesDownloaded
+			payload["bytesTotal"] = result.BytesTotal
+			payload["speed"] = result.Speed
+		}
+		c.emitEvent("download-progress", payload)
 	})
 
 	// Start download manager workers

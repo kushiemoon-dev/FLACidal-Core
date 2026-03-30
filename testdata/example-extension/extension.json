@@ -1,0 +1,30 @@
+{
+  "id": "com.example.demo-source",
+  "name": "Demo Source",
+  "version": "1.0.0",
+  "minAppVersion": "0.1.0",
+  "author": "FLACidal Team",
+  "description": "Example extension demonstrating the extension system",
+  "capabilities": ["source"],
+  "permissions": ["network"],
+  "sourceConfig": {
+    "name": "demo",
+    "displayName": "Demo Source",
+    "urlPattern": "demo\\.example\\.com",
+    "baseUrl": "https://api.demo.example.com",
+    "trackEndpoint": "/track/{id}",
+    "albumEndpoint": "/album/{id}",
+    "searchEndpoint": "/search?q={query}",
+    "streamEndpoint": "/stream/{id}?quality={quality}",
+    "trackMapping": {
+      "title": "data.title",
+      "artist": "data.artist.name",
+      "album": "data.album.title",
+      "duration": "data.duration"
+    },
+    "streamUrlField": "data.url"
+  },
+  "authFields": [
+    {"key": "Authorization", "label": "API Token", "type": "password", "required": true}
+  ]
+}
