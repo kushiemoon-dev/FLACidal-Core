@@ -7,7 +7,7 @@ OUT_DIR ?= build
 # Mobile app jniLibs directory
 MOBILE_DIR ?= ../flacidal-mobile/android/app/src/main/jniLibs
 
-.PHONY: all android ios linux clean install-android
+.PHONY: all android ios linux clean install-android install-ios
 
 all: android
 
@@ -60,15 +60,36 @@ linux:
 		-o $(OUT_DIR)/linux/libflacidal.so \
 		./cmd/bridge/
 
-# Build for iOS (requires macOS + Xcode)
+# Build for iOS (requires macOS + Xcode Command Line Tools)
+# On macOS: make ios
+# SDK path auto-detected via xcrun; override with IOS_SDK_PATH if needed
+IOS_SDK_PATH ?= $(shell xcrun --sdk iphoneos --show-sdk-path 2>/dev/null)
+IOS_CLANG ?= $(shell xcrun --sdk iphoneos --find clang 2>/dev/null || echo clang)
+IOS_MIN_VERSION ?= 16.0
+
 ios:
 	@mkdir -p $(OUT_DIR)/ios
+	@if [ -z "$(IOS_SDK_PATH)" ]; then \
+		echo "ERROR: iOS SDK not found. Xcode + Command Line Tools required."; \
+		echo "  Install: xcode-select --install"; \
+		echo "  Or set IOS_SDK_PATH manually."; \
+		exit 1; \
+	fi
 	CGO_ENABLED=1 \
 	GOOS=ios \
 	GOARCH=arm64 \
+	CC="$(IOS_CLANG) -arch arm64 -isysroot $(IOS_SDK_PATH) -miphoneos-version-min=$(IOS_MIN_VERSION)" \
 	go build -buildmode=c-archive \
 		-o $(OUT_DIR)/ios/libflacidal.a \
 		./cmd/bridge/
+
+# Install .a + header into Flutter iOS project
+IOS_MOBILE_DIR ?= ../flacidal-mobile/ios/Runner
+install-ios: ios
+	@mkdir -p $(IOS_MOBILE_DIR)
+	cp $(OUT_DIR)/ios/libflacidal.a $(IOS_MOBILE_DIR)/
+	cp $(OUT_DIR)/ios/libflacidal.h $(IOS_MOBILE_DIR)/
+	@echo "Installed libflacidal.a + .h to $(IOS_MOBILE_DIR)"
 
 clean:
 	rm -rf $(OUT_DIR)

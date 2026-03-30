@@ -3,3 +3,10 @@ bridge
 *.a
 *.h
 *.dylib
+
+# Dev/plan files
+task_plan*.md
+findings*.md
+progress*.md
+CLAUDE.md
+*.plan
