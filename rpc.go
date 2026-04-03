@@ -71,6 +71,25 @@ func (c *Core) dispatch(method string, params json.RawMessage) (interface{}, err
 			return nil, fmt.Errorf("invalid params: %w", err)
 		}
 		c.downloader.SetOptions(opts)
+		// Persist to config file
+		c.config.DownloadQuality = opts.Quality
+		c.config.FileNameFormat = opts.FileNameFormat
+		c.config.OrganizeFolders = opts.OrganizeFolders
+		c.config.FolderTemplate = opts.FolderTemplate
+		c.config.EmbedCover = opts.EmbedCover
+		c.config.SaveCoverFile = opts.SaveCoverFile
+		c.config.SaveFolderCover = opts.SaveFolderCover
+		c.config.AutoAnalyze = opts.AutoAnalyze
+		c.config.AutoQualityFallback = opts.AutoQualityFallback
+		c.config.QualityOrder = opts.QualityFallbackOrder
+		c.config.FirstArtistOnly = opts.FirstArtistOnly
+		c.config.SkipExisting = opts.SkipExisting
+		c.config.ArtistSeparator = opts.ArtistSeparator
+		c.config.PlaylistSubfolder = opts.PlaylistSubfolder
+		c.config.SaveLyricsFile = opts.SaveLyricsFile
+		if err := SaveConfig(c.config); err != nil {
+			return nil, fmt.Errorf("failed to save config: %w", err)
+		}
 		return map[string]string{"status": "ok"}, nil
 
 	// ── Content Fetching ────────────────────────────────────
@@ -90,11 +109,22 @@ func (c *Core) dispatch(method string, params json.RawMessage) (interface{}, err
 		if err := json.Unmarshal(params, &p); err != nil {
 			return nil, fmt.Errorf("invalid params: %w", err)
 		}
+		// Try source manager first (supports Tidal + Qobuz + others)
+		if c.sourceManager != nil {
+			if source, err := c.sourceManager.DetectSource(p.URL); err == nil {
+				id, contentType, err := source.ParseURL(p.URL)
+				if err != nil {
+					return nil, err
+				}
+				return map[string]string{"id": id, "type": contentType, "source": source.Name()}, nil
+			}
+		}
+		// Fallback to Tidal-only parsing
 		id, contentType, err := ParseTidalURL(p.URL)
 		if err != nil {
 			return nil, err
 		}
-		return map[string]string{"id": id, "type": contentType}, nil
+		return map[string]string{"id": id, "type": contentType, "source": "tidal"}, nil
 
 	case "detectSource":
 		var p struct {
@@ -117,7 +147,11 @@ func (c *Core) dispatch(method string, params json.RawMessage) (interface{}, err
 		if p.Limit <= 0 {
 			p.Limit = 20
 		}
-		return c.downloader.SearchTracks(p.Query, p.Limit)
+		results, err := c.downloader.SearchTracks(p.Query, p.Limit)
+		if err != nil {
+			return nil, err
+		}
+		return convertSearchResults(results), nil
 
 	case "searchTidalAlbums":
 		var p struct {
@@ -378,12 +412,20 @@ func (c *Core) dispatch(method string, params json.RawMessage) (interface{}, err
 
 	case "setPreferredSource":
 		var p struct {
-			Source string `json:"source"`
+			Source   string `json:"source"`
+			Fallback *bool  `json:"fallback,omitempty"`
 		}
 		if err := json.Unmarshal(params, &p); err != nil {
 			return nil, fmt.Errorf("invalid params: %w", err)
 		}
 		c.sourceManager.SetPreferredSource(p.Source)
+		c.config.PreferredSource = p.Source
+		if p.Fallback != nil {
+			c.config.AutoQualityFallback = *p.Fallback
+		}
+		if err := SaveConfig(c.config); err != nil {
+			return nil, fmt.Errorf("failed to save config: %w", err)
+		}
 		return map[string]string{"status": "ok"}, nil
 
 	case "updateQobuzCredentials":
@@ -396,6 +438,14 @@ func (c *Core) dispatch(method string, params json.RawMessage) (interface{}, err
 			return nil, fmt.Errorf("invalid params: %w", err)
 		}
 		c.qobuzSource.SetCredentials(p.AppID, p.AppSecret, p.AuthToken)
+		// Persist credentials to config file
+		c.config.QobuzAppID = p.AppID
+		c.config.QobuzAppSecret = p.AppSecret
+		c.config.QobuzAuthToken = p.AuthToken
+		c.config.QobuzEnabled = p.AppID != "" && p.AuthToken != ""
+		if err := SaveConfig(c.config); err != nil {
+			return nil, fmt.Errorf("failed to save config: %w", err)
+		}
 		return map[string]string{"status": "ok"}, nil
 
 	// ── Extensions ─────────────────────────────────────────
@@ -558,16 +608,64 @@ func (c *Core) dispatch(method string, params json.RawMessage) (interface{}, err
 	}
 }
 
-// fetchContent fetches content from a Tidal URL via HiFi proxy (same as desktop).
+// convertSearchResults converts raw Tidal API search results to flat TidalTrack
+// structs with artist names as strings (not nested objects).
+func convertSearchResults(results []TidalHifiTrackResponse) []TidalTrack {
+	tracks := make([]TidalTrack, len(results))
+	for i, r := range results {
+		artistStr := r.Artist.Name
+		var allArtists []string
+		for _, a := range r.Artists {
+			allArtists = append(allArtists, a.Name)
+		}
+		allArtistsStr := artistStr
+		if len(allArtists) > 0 {
+			allArtistsStr = strings.Join(allArtists, ", ")
+		}
+		coverURL := ""
+		if r.Album.Cover != "" {
+			coverURL = fmt.Sprintf("https://resources.tidal.com/images/%s/320x320.jpg",
+				FormatCoverUUID(r.Album.Cover))
+		}
+		tracks[i] = TidalTrack{
+			ID:          r.ID,
+			Title:       r.Title,
+			Artist:      artistStr,
+			Artists:     allArtistsStr,
+			Album:       r.Album.Title,
+			AlbumArtist: r.Album.Artist.Name,
+			Duration:    r.Duration,
+			ISRC:        r.ISRC,
+			CoverURL:    coverURL,
+			Explicit:    r.Explicit,
+			TrackNum:    r.TrackNumber,
+			DiscNum:     r.VolumeNumber,
+			ReleaseDate: r.Album.ReleaseDate,
+		}
+	}
+	return tracks
+}
+
+// fetchContent fetches content from any supported URL (Tidal, Qobuz, etc.).
 func (c *Core) fetchContent(rawURL string) (interface{}, error) {
+	// Try multi-source detection first
+	if c.sourceManager != nil {
+		source, err := c.sourceManager.DetectSource(rawURL)
+		if err == nil && source.Name() != "tidal" {
+			return c.fetchContentFromSource(source, rawURL)
+		}
+	}
+
+	// Tidal path (default) — uses HiFi proxy for better results
 	id, contentType, err := ParseTidalURL(rawURL)
 	if err != nil {
 		return nil, err
 	}
 
 	result := map[string]interface{}{
-		"type": contentType,
-		"id":   id,
+		"type":   contentType,
+		"id":     id,
+		"source": "tidal",
 	}
 
 	switch contentType {
@@ -610,6 +708,68 @@ func (c *Core) fetchContent(rawURL string) (interface{}, error) {
 
 	case "artist":
 		return c.tidalClient.GetArtistDiscography(id)
+
+	default:
+		return nil, fmt.Errorf("unsupported content type: %s", contentType)
+	}
+
+	return result, nil
+}
+
+// fetchContentFromSource fetches content using the source manager (Qobuz, etc.).
+func (c *Core) fetchContentFromSource(source MusicSource, rawURL string) (interface{}, error) {
+	id, contentType, err := source.ParseURL(rawURL)
+	if err != nil {
+		return nil, err
+	}
+
+	if !source.IsAvailable() {
+		return nil, fmt.Errorf("%s is not available — check your credentials in Settings", source.DisplayName())
+	}
+
+	result := map[string]interface{}{
+		"type":   contentType,
+		"id":     id,
+		"source": source.Name(),
+	}
+
+	switch contentType {
+	case "track":
+		track, err := source.GetTrack(id)
+		if err != nil {
+			return nil, err
+		}
+		artists := track.Artist
+		if len(track.Artists) > 0 {
+			artists = strings.Join(track.Artists, ", ")
+		}
+		result["title"] = track.Title
+		result["creator"] = artists
+		result["coverUrl"] = track.CoverURL
+		result["tracks"] = []SourceTrack{*track}
+		result["trackCount"] = 1
+
+	case "album":
+		album, err := source.GetAlbum(id)
+		if err != nil {
+			return nil, err
+		}
+		result["title"] = album.Title
+		result["creator"] = album.Artist
+		result["coverUrl"] = album.CoverURL
+		result["tracks"] = album.Tracks
+		result["trackCount"] = len(album.Tracks)
+
+	case "playlist":
+		playlist, err := source.GetPlaylist(id)
+		if err != nil {
+			return nil, err
+		}
+		result["title"] = playlist.Title
+		result["creator"] = playlist.Creator
+		result["coverUrl"] = playlist.CoverURL
+		result["tracks"] = playlist.Tracks
+		result["trackCount"] = len(playlist.Tracks)
 
 	default:
 		return nil, fmt.Errorf("unsupported content type: %s", contentType)
