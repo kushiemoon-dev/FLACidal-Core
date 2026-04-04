@@ -737,6 +737,7 @@ func (dm *DownloadManager) QueueQobuzTracks(tracks []SourceTrack, outputDir stri
 			Artist:     t.Artist,
 			ISRC:       t.ISRC,
 			Duration:   t.Duration,
+			Quality:    dm.service.GetOptions().Quality,
 			Source:     "qobuz",
 			ctx:        ctx,
 			cancelFunc: cancel,

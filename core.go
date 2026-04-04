@@ -125,6 +125,8 @@ func NewCore(dataDir string) (*Core, error) {
 		c.qobuzSource.SetCredentials(config.QobuzAppID, config.QobuzAppSecret, config.QobuzAuthToken)
 	}
 
+	c.downloadManager.SetFallbackQobuzSource(c.qobuzSource)
+
 	c.sourceManager = NewSourceManager()
 	c.sourceManager.RegisterSource(c.tidalSource)
 	c.sourceManager.RegisterSource(c.qobuzSource)

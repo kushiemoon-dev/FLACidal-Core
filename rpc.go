@@ -459,6 +459,15 @@ func (c *Core) dispatch(method string, params json.RawMessage) (interface{}, err
 		}
 		return map[string]string{"status": "ok"}, nil
 
+	case "testQobuzConnection":
+		if c.qobuzSource == nil || !c.qobuzSource.IsAvailable() {
+			return map[string]interface{}{"success": false, "error": "Qobuz not configured"}, nil
+		}
+		if err := c.qobuzSource.TestConnection(); err != nil {
+			return map[string]interface{}{"success": false, "error": err.Error()}, nil
+		}
+		return map[string]interface{}{"success": true}, nil
+
 	// ── Extensions ─────────────────────────────────────────
 	case "getExtensions":
 		return c.extensionManager.GetInstalled(), nil

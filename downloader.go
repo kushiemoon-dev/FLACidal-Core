@@ -210,7 +210,7 @@ func NewTidalHifiService() *TidalHifiService {
 			Transport: downloadTransport,
 		},
 		options: DownloadOptions{
-			Quality:         "LOSSLESS",
+			Quality:         "HI_RES",
 			FileNameFormat:  "{artist} - {title}",
 			OrganizeFolders: false,
 			EmbedCover:      true,
@@ -471,18 +471,8 @@ func (t *TidalHifiService) GetStreamURL(trackID int) (*StreamInfo, error) {
 	return t.getStreamURLForQuality(trackID, quality)
 }
 
-// getStreamURLForQuality fetches the stream URL requesting a specific quality level.
-func (t *TidalHifiService) getStreamURLForQuality(trackID int, quality string) (*StreamInfo, error) {
-	// Normalize UI labels to valid Tidal API parameters
-	switch quality {
-	case "HI_RES_LOSSLESS", "HI_RES_MAX":
-		quality = "HI_RES"
-	}
-	body, err := t.makeAPIRequest(fmt.Sprintf("/track/?id=%d&quality=%s", trackID, quality))
-	if err != nil {
-		return nil, fmt.Errorf("stream request failed: %w", err)
-	}
-
+// parseStreamBody parses a raw stream/manifest API response into StreamInfo.
+func (t *TidalHifiService) parseStreamBody(body []byte, quality string, trackID int) (*StreamInfo, error) {
 	// Try v2.0 wrapper format first
 	var streamDataResp TidalStreamDataResponse
 	if err := json.Unmarshal(body, &streamDataResp); err != nil {
@@ -530,6 +520,74 @@ func (t *TidalHifiService) getStreamURLForQuality(trackID int, quality string) (
 		AudioQuality: audioQuality,
 		AudioMode:    audioMode,
 	}, nil
+}
+
+// getStreamURLForQuality fetches the stream URL requesting a specific quality level.
+// It iterates all endpoints and prefers one that returns the exact quality requested.
+// If no endpoint matches exactly, the best available downgrade is returned.
+func (t *TidalHifiService) getStreamURLForQuality(trackID int, quality string) (*StreamInfo, error) {
+	// Normalize UI labels to valid Tidal API parameters
+	switch quality {
+	case "HI_RES_LOSSLESS", "HI_RES_MAX":
+		quality = "HI_RES"
+	}
+
+	path := fmt.Sprintf("/track/?id=%d&quality=%s", trackID, quality)
+
+	t.endpointMu.Lock()
+	toTry := t.getOrderedEndpoints()
+	t.endpointMu.Unlock()
+
+	if len(toTry) == 0 {
+		toTry = []string{tidalHifiAPIBase}
+	}
+
+	var bestDowngrade *StreamInfo
+	var lastErr error
+
+	for _, endpoint := range toTry {
+		body, err := t.tryAPIRequest(endpoint, path)
+		if err != nil {
+			lastErr = err
+			t.blacklistEndpoint(endpoint)
+			if t.logger != nil {
+				t.logger.Warn(fmt.Sprintf("Tidal endpoint %s failed: %v", endpoint, err))
+			}
+			continue
+		}
+
+		info, err := t.parseStreamBody(body, quality, trackID)
+		if err != nil {
+			lastErr = err
+			t.blacklistEndpoint(endpoint)
+			continue
+		}
+
+		// Exact quality match — use this endpoint
+		if info.AudioQuality == quality || info.AudioQuality == "" {
+			return info, nil
+		}
+
+		// Quality mismatch — save as fallback, try next endpoint
+		if bestDowngrade == nil {
+			bestDowngrade = info
+			if t.logger != nil {
+				t.logger.Warn(fmt.Sprintf("endpoint %s returned %s instead of requested %s for track %d, trying other endpoints",
+					endpoint, info.AudioQuality, quality, trackID))
+			}
+		}
+	}
+
+	// No endpoint returned exact quality — accept best downgrade if available
+	if bestDowngrade != nil {
+		if t.logger != nil {
+			t.logger.Warn(fmt.Sprintf("no endpoint supports %s for track %d, accepting %s",
+				quality, trackID, bestDowngrade.AudioQuality))
+		}
+		return bestDowngrade, nil
+	}
+
+	return nil, fmt.Errorf("stream request failed for quality %s: %v", quality, lastErr)
 }
 
 // getStreamURLWithFallback tries the configured quality first, then walks down

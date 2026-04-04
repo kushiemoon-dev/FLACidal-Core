@@ -327,6 +327,18 @@ func (q *QobuzSource) SetCredentials(appID, appSecret, userAuthToken string) {
 	q.available = appID != "" && appSecret != ""
 }
 
+// TestConnection validates credentials by calling the Qobuz user/get endpoint.
+func (q *QobuzSource) TestConnection() error {
+	if q.appID == "" || q.userAuthToken == "" {
+		return fmt.Errorf("Qobuz credentials not configured")
+	}
+	_, err := q.makeRequest("user/get", url.Values{})
+	if err != nil {
+		return fmt.Errorf("Qobuz connection failed: %w", err)
+	}
+	return nil
+}
+
 // ParseURL extracts content ID and type from a Qobuz URL
 func (q *QobuzSource) ParseURL(rawURL string) (id string, contentType string, err error) {
 	if matches := qobuzTrackRegex.FindStringSubmatch(rawURL); len(matches) > 1 {
