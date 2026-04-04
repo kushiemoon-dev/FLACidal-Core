@@ -55,7 +55,9 @@ func FlacInit(dataDir *C.char) *C.char {
 		}
 		cstr := C.CString(string(data))
 		C.invokeCallback(cstr)
-		C.free(unsafe.Pointer(cstr))
+		// Do NOT free here — Dart's NativeCallable.listener processes
+		// callbacks asynchronously; the pointer must remain valid until
+		// Dart copies the string. Dart calls FlacFree after reading.
 	})
 
 	return C.CString(`{"result":{"status":"ok"}}`)
