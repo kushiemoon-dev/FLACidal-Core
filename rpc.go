@@ -191,6 +191,17 @@ func (c *Core) dispatch(method string, params json.RawMessage) (interface{}, err
 		queued := c.downloadManager.QueueMultiple(p.Tracks, p.OutputDir)
 		return map[string]int{"queued": queued}, nil
 
+	case "queueQobuzDownloads":
+		var p struct {
+			Tracks    []SourceTrack `json:"tracks"`
+			OutputDir string        `json:"outputDir"`
+		}
+		if err := json.Unmarshal(params, &p); err != nil {
+			return nil, fmt.Errorf("invalid params: %w", err)
+		}
+		queued := c.downloadManager.QueueQobuzTracks(p.Tracks, p.OutputDir)
+		return map[string]int{"queued": queued}, nil
+
 	case "queueSingle":
 		var p struct {
 			TrackID   int    `json:"trackId"`

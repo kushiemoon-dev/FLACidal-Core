@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"os"
 	"path/filepath"
 	"strings"
@@ -60,6 +61,7 @@ type DownloadJob struct {
 	Copyright  string             `json:"copyright,omitempty"` // Copyright string to embed in tags
 	Label      string             `json:"label,omitempty"`     // Record label to embed in tags
 	Quality    string             `json:"quality,omitempty"`   // Per-track quality override (empty = use global)
+	Source     string             `json:"source,omitempty"`    // "tidal" or "qobuz" — routes to correct downloader
 	ctx        context.Context    // For cancellation
 	cancelFunc context.CancelFunc // Cancel function
 }
@@ -245,10 +247,22 @@ func (dm *DownloadManager) processJob(job *DownloadJob) {
 		dm.service.SetOptions(opts)
 	}
 
-	// Download — try primary (Tidal) first, then fallback sources
-	result, err := dm.service.DownloadTrack(job.TrackID, job.OutputDir, job.Copyright, job.Label)
-	if (err != nil || (result != nil && !result.Success)) && dm.qobuzFallbackEnabled() && job.ISRC != "" {
-		result, err = dm.downloadViaQobuzFallback(job, result)
+	// Download — route by source
+	var result *DownloadResult
+	var err error
+	if job.Source == "qobuz" && dm.qobuzSource != nil && dm.qobuzSource.IsAvailable() {
+		opts := dm.service.GetOptions()
+		result, err = dm.qobuzSource.DownloadTrack(
+			strconv.Itoa(job.TrackID), job.OutputDir, opts,
+		)
+		if result != nil {
+			result.Source = "qobuz"
+		}
+	} else {
+		result, err = dm.service.DownloadTrack(job.TrackID, job.OutputDir, job.Copyright, job.Label)
+		if (err != nil || (result != nil && !result.Success)) && dm.qobuzFallbackEnabled() && job.ISRC != "" {
+			result, err = dm.downloadViaQobuzFallback(job, result)
+		}
 	}
 
 	// Clear byte-level progress callback
@@ -698,4 +712,45 @@ func (dm *DownloadManager) RestoreQueue(path string) (int, error) {
 
 	os.Remove(path) // Clean up after restoring
 	return restored, nil
+}
+
+// QueueQobuzTracks queues Qobuz-sourced tracks for download via QobuzSource.
+func (dm *DownloadManager) QueueQobuzTracks(tracks []SourceTrack, outputDir string) int {
+	dm.mu.RLock()
+	if !dm.running {
+		dm.mu.RUnlock()
+		return 0
+	}
+	dm.mu.RUnlock()
+
+	queued := 0
+	for _, t := range tracks {
+		trackID, err := strconv.Atoi(t.ID)
+		if err != nil {
+			continue
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		job := &DownloadJob{
+			TrackID:    trackID,
+			OutputDir:  outputDir,
+			Title:      t.Title,
+			Artist:     t.Artist,
+			ISRC:       t.ISRC,
+			Duration:   t.Duration,
+			Source:     "qobuz",
+			ctx:        ctx,
+			cancelFunc: cancel,
+		}
+		dm.queue <- job
+		if dm.onProgress != nil {
+			dm.onProgress(trackID, "queued", &DownloadResult{TrackID: trackID, Title: t.Title, Artist: t.Artist})
+		}
+		queued++
+	}
+	if dm.generateM3U8 && queued > 0 {
+		dm.batchMu.Lock()
+		dm.batches[outputDir] = &m3u8Batch{total: queued}
+		dm.batchMu.Unlock()
+	}
+	return queued
 }
