@@ -18,6 +18,11 @@ type FLACMetadata struct {
 	Date         string `json:"date"`
 	Genre        string `json:"genre"`
 	ISRC         string `json:"isrc"`
+	AlbumArtist  string `json:"albumArtist,omitempty"`
+	DiscNumber   string `json:"discNumber,omitempty"`
+	Copyright    string `json:"copyright,omitempty"`
+	Label        string `json:"label,omitempty"`
+	Composer     string `json:"composer,omitempty"`
 	Comment      string `json:"comment"`
 	Size         int64  `json:"size"`
 	Duration     int    `json:"duration"`   // seconds
@@ -190,6 +195,16 @@ func parseVorbisComment(data []byte, meta *FLACMetadata) {
 			meta.Genre = value
 		case "ISRC":
 			meta.ISRC = value
+		case "ALBUMARTIST":
+			meta.AlbumArtist = value
+		case "DISCNUMBER":
+			meta.DiscNumber = value
+		case "COPYRIGHT":
+			meta.Copyright = value
+		case "ORGANIZATION":
+			meta.Label = value
+		case "COMPOSER":
+			meta.Composer = value
 		case "COMMENT", "DESCRIPTION":
 			meta.Comment = value
 		case "LYRICS", "UNSYNCEDLYRICS":

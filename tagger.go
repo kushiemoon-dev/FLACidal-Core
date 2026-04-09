@@ -31,12 +31,13 @@ type TrackMetadata struct {
 	Genre       string
 	ISRC        string
 	CoverURL    string
-	CoverArt    []byte // Raw cover art data (used by MP3 tagger)
-	Composer    string // Composer (TCOM in ID3v2)
+	CoverArt []byte // Raw cover art data (used by MP3 tagger)
 	// Lyrics fields
 	Lyrics       string // Plain text lyrics (LYRICS tag)
 	SyncedLyrics string // LRC format synced lyrics (SYNCEDLYRICS tag)
 	OriginalDate string // Original release date (ORIGINALDATE tag)
+	// Additional fields
+	Composer string // Composer (TCOM in ID3v2, COMPOSER in Vorbis)
 	// Rights fields
 	Copyright string // COPYRIGHT Vorbis comment
 	Label   string // ORGANIZATION Vorbis comment (record label)

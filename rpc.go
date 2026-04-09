@@ -303,6 +303,168 @@ func (c *Core) dispatch(method string, params json.RawMessage) (interface{}, err
 		}
 		return ReadFLACMetadata(p.Path)
 
+	case "editMetadata":
+		var p struct {
+			Path     string `json:"path"`
+			Metadata struct {
+				Title       string `json:"title"`
+				Artist      string `json:"artist"`
+				Album       string `json:"album"`
+				AlbumArtist string `json:"albumArtist"`
+				TrackNumber int    `json:"trackNumber"`
+				DiscNumber  int    `json:"discNumber"`
+				Year        string `json:"year"`
+				Genre       string `json:"genre"`
+				ISRC        string `json:"isrc"`
+				Label       string `json:"label"`
+				Copyright   string `json:"copyright"`
+				Composer    string `json:"composer"`
+				Comment     string `json:"comment"`
+			} `json:"metadata"`
+		}
+		if err := json.Unmarshal(params, &p); err != nil {
+			return nil, fmt.Errorf("invalid params: %w", err)
+		}
+		ext := strings.ToLower(filepath.Ext(p.Path))
+		if ext != ".flac" {
+			return nil, fmt.Errorf("unsupported file type: %s (only .flac supported)", ext)
+		}
+		// Read existing file to preserve cover art
+		existingData, err := os.ReadFile(p.Path)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read file: %w", err)
+		}
+		tagger := NewFLACTagger()
+		meta := TrackMetadata{
+			Title:       p.Metadata.Title,
+			Artist:      p.Metadata.Artist,
+			Album:       p.Metadata.Album,
+			AlbumArtist: p.Metadata.AlbumArtist,
+			TrackNumber: p.Metadata.TrackNumber,
+			DiscNumber:  p.Metadata.DiscNumber,
+			Year:        p.Metadata.Year,
+			Genre:       p.Metadata.Genre,
+			ISRC:        p.Metadata.ISRC,
+			Label:       p.Metadata.Label,
+			Copyright:   p.Metadata.Copyright,
+			Composer:    p.Metadata.Composer,
+			Comment:     p.Metadata.Comment,
+		}
+		// Rebuild preserving existing cover art
+		newData, err := tagger.RebuildPreservingCover(existingData, meta)
+		if err != nil {
+			return nil, fmt.Errorf("failed to rebuild FLAC: %w", err)
+		}
+		if err := os.WriteFile(p.Path, newData, 0644); err != nil {
+			return nil, fmt.Errorf("failed to write file: %w", err)
+		}
+		return map[string]bool{"success": true}, nil
+
+	case "extractCoverArt":
+		var p struct {
+			Path       string `json:"path"`
+			OutputPath string `json:"outputPath"`
+		}
+		if err := json.Unmarshal(params, &p); err != nil {
+			return nil, fmt.Errorf("invalid params: %w", err)
+		}
+		imageData, mimeType, err := GetCoverArt(p.Path)
+		if err != nil {
+			return nil, err
+		}
+		outputPath := p.OutputPath
+		if outputPath == "" {
+			outputPath = filepath.Join(filepath.Dir(p.Path), "cover.jpg")
+		}
+		ext := ".jpg"
+		if strings.Contains(mimeType, "png") {
+			ext = ".png"
+		}
+		if !strings.HasSuffix(outputPath, ext) && !strings.HasSuffix(outputPath, ".jpg") && !strings.HasSuffix(outputPath, ".png") {
+			outputPath += ext
+		}
+		if err := os.WriteFile(outputPath, imageData, 0644); err != nil {
+			return nil, fmt.Errorf("failed to write cover art: %w", err)
+		}
+		return map[string]interface{}{"success": true, "path": outputPath}, nil
+
+	case "saveLyricsToFile":
+		var p struct {
+			Path   string `json:"path"`
+			Lyrics string `json:"lyrics"`
+		}
+		if err := json.Unmarshal(params, &p); err != nil {
+			return nil, fmt.Errorf("invalid params: %w", err)
+		}
+		if p.Lyrics != "" {
+			// Save provided lyrics directly
+			lrcPath := strings.TrimSuffix(p.Path, filepath.Ext(p.Path)) + ".lrc"
+			if err := os.WriteFile(lrcPath, []byte(p.Lyrics), 0644); err != nil {
+				return nil, fmt.Errorf("failed to write lyrics: %w", err)
+			}
+			return map[string]interface{}{"success": true, "path": lrcPath}, nil
+		}
+		// Auto-fetch from LRCLIB using file metadata
+		fileMeta, err := ReadFLACMetadata(p.Path)
+		if err != nil {
+			return nil, fmt.Errorf("cannot read metadata: %w", err)
+		}
+		client := NewLyricsClient()
+		lyricsResult, err := client.FetchLyricsForFile(fileMeta)
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch lyrics: %w", err)
+		}
+		synced := lyricsResult.Synced
+		plain := lyricsResult.Plain
+		if synced == "" && plain == "" {
+			return nil, fmt.Errorf("no lyrics found for this track")
+		}
+		if err := SaveLyricsFile(p.Path, synced, plain); err != nil {
+			return nil, err
+		}
+		savedPath := strings.TrimSuffix(p.Path, filepath.Ext(p.Path))
+		if synced != "" {
+			savedPath += ".lrc"
+		} else {
+			savedPath += ".txt"
+		}
+		return map[string]interface{}{"success": true, "path": savedPath}, nil
+
+	case "reEnrichMetadata":
+		var p struct {
+			Path string `json:"path"`
+		}
+		if err := json.Unmarshal(params, &p); err != nil {
+			return nil, fmt.Errorf("invalid params: %w", err)
+		}
+		fileMeta, err := ReadFLACMetadata(p.Path)
+		if err != nil {
+			return nil, fmt.Errorf("cannot read metadata: %w", err)
+		}
+		var updatedFields []string
+		// Try to fetch lyrics if not present
+		if !fileMeta.HasLyrics {
+			client := NewLyricsClient()
+			lyricsResult, err := client.FetchLyricsForFile(fileMeta)
+			if err == nil {
+				if lyricsResult != nil {
+					lr := lyricsResult
+					tagger := NewFLACTagger()
+					if lr.Synced != "" || lr.Plain != "" {
+						if err := tagger.EmbedLyrics(p.Path, lr.Plain, lr.Synced); err == nil {
+							updatedFields = append(updatedFields, "lyrics")
+						}
+						// Also save .lrc file
+						_ = SaveLyricsFile(p.Path, lr.Synced, lr.Plain)
+					}
+				}
+			}
+		}
+		return map[string]interface{}{
+			"success":       true,
+			"updated_fields": updatedFields,
+		}, nil
+
 	// ── Analysis ────────────────────────────────────────────
 	case "analyzeFile":
 		var p struct {
