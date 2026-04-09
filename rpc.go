@@ -762,7 +762,7 @@ func (c *Core) dispatch(method string, params json.RawMessage) (interface{}, err
 		return map[string]string{"status": "ok"}, nil
 
 	case "getVersion":
-		return map[string]string{"version": "3.2.1-mobile"}, nil
+		return map[string]string{"version": "0.4.0"}, nil
 
 	case "getCacheStats":
 		if c.db == nil {
