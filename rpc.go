@@ -166,7 +166,7 @@ func (c *Core) dispatch(method string, params json.RawMessage) (interface{}, err
 		if p.Limit <= 0 {
 			p.Limit = 20
 		}
-		return c.tidalClient.SearchAlbums(p.Query, p.Limit)
+		return c.tidalSource.SearchAlbums(p.Query, p.Limit)
 
 	case "searchTidalArtists":
 		var p struct {
@@ -179,7 +179,7 @@ func (c *Core) dispatch(method string, params json.RawMessage) (interface{}, err
 		if p.Limit <= 0 {
 			p.Limit = 20
 		}
-		return c.tidalClient.SearchArtists(p.Query, p.Limit)
+		return c.tidalSource.SearchArtists(p.Query, p.Limit)
 
 	// ── Download Queue ──────────────────────────────────────
 	case "queueDownloads":

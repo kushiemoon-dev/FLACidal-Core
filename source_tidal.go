@@ -237,6 +237,16 @@ func (t *TidalSource) DownloadTrack(trackID string, outputDir string, options Do
 	return t.service.DownloadTrack(id, outputDir, "", "")
 }
 
+// SearchAlbums searches for albums via the proxy (Tidal v1 credentials are revoked).
+func (t *TidalSource) SearchAlbums(query string, limit int) ([]TidalAlbum, error) {
+	return t.service.SearchAlbumsFromProxy(query, limit)
+}
+
+// SearchArtists searches for artists via the proxy (Tidal v1 credentials are revoked).
+func (t *TidalSource) SearchArtists(query string, limit int) ([]TidalArtist, error) {
+	return t.service.SearchArtistsFromProxy(query, limit)
+}
+
 // GetService returns the underlying TidalHifiService
 func (t *TidalSource) GetService() *TidalHifiService {
 	return t.service

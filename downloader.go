@@ -106,6 +106,7 @@ type TidalHifiTrackResponse struct {
 		Name string `json:"name"`
 	} `json:"artists"`
 	Album struct {
+		ID          int    `json:"id"`
 		Title       string `json:"title"`
 		Cover       string `json:"cover"`
 		ReleaseDate string `json:"releaseDate"`
@@ -681,6 +682,98 @@ func (t *TidalHifiService) SearchTracks(query string, limit int) ([]TidalHifiTra
 		items = items[:limit]
 	}
 	return items, nil
+}
+
+// SearchAlbumsFromProxy searches for albums via the proxy by extracting unique albums
+// from track search results. Used as a fallback when the Tidal v1 API credentials are revoked.
+func (t *TidalHifiService) SearchAlbumsFromProxy(query string, limit int) ([]TidalAlbum, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+
+	body, err := t.makeAPIRequest("/search/?s=" + url.QueryEscape(query))
+	if err != nil {
+		return nil, fmt.Errorf("album search failed: %w", err)
+	}
+
+	items, err := parseSearchBody(body)
+	if err != nil {
+		return nil, err
+	}
+
+	seen := make(map[string]struct{})
+	albums := make([]TidalAlbum, 0)
+	for _, track := range items {
+		key := track.Album.Title + "|" + track.Album.Artist.Name
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+
+		artistName := track.Album.Artist.Name
+		if artistName == "" && len(track.Album.Artists) > 0 {
+			artistName = track.Album.Artists[0].Name
+		}
+		if artistName == "" {
+			artistName = track.Artist.Name
+		}
+
+		albums = append(albums, TidalAlbum{
+			ID:          track.Album.ID,
+			Title:       track.Album.Title,
+			Artist:      artistName,
+			ReleaseDate: track.Album.ReleaseDate,
+			TrackCount:  track.Album.NumberOfTracks,
+			CoverURL:    formatTidalImageURL(track.Album.Cover),
+		})
+
+		if len(albums) >= limit {
+			break
+		}
+	}
+
+	return albums, nil
+}
+
+// SearchArtistsFromProxy searches for artists via the proxy by extracting unique artists
+// from track search results. Used as a fallback when the Tidal v1 API credentials are revoked.
+func (t *TidalHifiService) SearchArtistsFromProxy(query string, limit int) ([]TidalArtist, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+
+	body, err := t.makeAPIRequest("/search/?s=" + url.QueryEscape(query))
+	if err != nil {
+		return nil, fmt.Errorf("artist search failed: %w", err)
+	}
+
+	items, err := parseSearchBody(body)
+	if err != nil {
+		return nil, err
+	}
+
+	seen := make(map[string]struct{})
+	artists := make([]TidalArtist, 0)
+	for _, track := range items {
+		name := track.Artist.Name
+		if name == "" {
+			continue
+		}
+		if _, exists := seen[name]; exists {
+			continue
+		}
+		seen[name] = struct{}{}
+
+		artists = append(artists, TidalArtist{
+			Name: name,
+		})
+
+		if len(artists) >= limit {
+			break
+		}
+	}
+
+	return artists, nil
 }
 
 // makeMetadataRequest tries each v2.4 metadata endpoint for album/playlist/mix paths.

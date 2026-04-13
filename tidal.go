@@ -81,14 +81,16 @@ var (
 	tidalMixRegex      = regexp.MustCompile(`tidal\.com/(?:browse/)?mix/([a-zA-Z0-9]+)`)
 )
 
-// NewTidalClient creates a new Tidal API client
-// Uses internal credentials that have playlist API access
+// NewTidalClient creates a new Tidal API client.
+// If clientID/clientSecret are non-empty they are used; otherwise falls back to internal credentials.
 func NewTidalClient(clientID, clientSecret string) *TidalClient {
-	// Always use internal credentials for playlist access
-	// User-provided credentials don't have the required tier
+	if clientID == "" || clientSecret == "" {
+		clientID = internalClientID
+		clientSecret = internalClientSecret
+	}
 	return &TidalClient{
-		clientID:     internalClientID,
-		clientSecret: internalClientSecret,
+		clientID:     clientID,
+		clientSecret: clientSecret,
 		CountryCode:  "US",
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
@@ -208,36 +210,62 @@ func (c *TidalClient) authenticate() error {
 	return nil
 }
 
-// doRequest makes an authenticated request to Tidal API
+// doRequest makes an authenticated request to Tidal API.
+// On a 401 response it clears the cached token and retries once.
 func (c *TidalClient) doRequest(endpoint string) ([]byte, error) {
 	if err := c.authenticate(); err != nil {
 		return nil, err
 	}
 
-	req, err := http.NewRequest("GET", tidalAPIBase+endpoint, nil)
+	body, statusCode, err := c.execRequest(endpoint)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
+		return nil, err
 	}
 
-	req.Header.Set("Authorization", "Bearer "+c.accessToken)
+	if statusCode == 401 {
+		// Token was rejected server-side; clear it and retry once
+		c.mu.Lock()
+		c.accessToken = ""
+		c.mu.Unlock()
+		if err := c.authenticate(); err != nil {
+			return nil, err
+		}
+		body, statusCode, err = c.execRequest(endpoint)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if statusCode != 200 {
+		return nil, fmt.Errorf("API error %d: %s", statusCode, string(body))
+	}
+	return body, nil
+}
+
+// execRequest performs a single GET request using the current access token.
+func (c *TidalClient) execRequest(endpoint string) ([]byte, int, error) {
+	c.mu.Lock()
+	token := c.accessToken
+	c.mu.Unlock()
+
+	req, err := http.NewRequest("GET", tidalAPIBase+endpoint, nil)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Accept", "application/json")
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("request failed: %w", err)
+		return nil, 0, fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read response: %w", err)
+		return nil, 0, fmt.Errorf("failed to read response: %w", err)
 	}
-
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, string(body))
-	}
-
-	return body, nil
+	return body, resp.StatusCode, nil
 }
 
 // GetPlaylist fetches a public playlist by UUID
