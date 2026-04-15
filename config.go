@@ -85,6 +85,16 @@ type Config struct {
 
 	// Auto-select best download service per track
 	AutoSelectService bool `json:"autoSelectService"` // Automatically pick the best source per track
+
+	// Amazon source
+	AmazonEnabled        bool     `json:"amazonEnabled"`
+	AmazonProxyEndpoints []string `json:"amazonProxyEndpoints,omitempty"`
+
+	// Qobuz proxy endpoints (credential-free community proxies)
+	QobuzProxyEndpoints []string `json:"qobuzProxyEndpoints,omitempty"`
+
+	// Parallel endpoint requests
+	ParallelEndpointRequests bool `json:"parallelEndpointRequests"`
 }
 
 var defaultConfig = Config{
@@ -103,8 +113,10 @@ var defaultConfig = Config{
 	EmbedLyrics:         false,
 	PreferSyncedLyrics:  true,
 	AutoAnalyze:         false,
-	TidalEnabled:        true,
-	QobuzEnabled:        false,
+	TidalEnabled:             true,
+	QobuzEnabled:             true,
+	AmazonEnabled:            false,
+	ParallelEndpointRequests: true,
 	PreferredSource:     "tidal",
 	SkipExisting:        true,
 	PlaylistSubfolder:   true,

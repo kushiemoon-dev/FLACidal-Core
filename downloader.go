@@ -1,6 +1,7 @@
 package core
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -12,7 +13,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -20,8 +20,7 @@ import (
 // Free Tidal FLAC proxy without credentials (same as mkv-video)
 
 const (
-	tidalHifiAPIBase     = "https://vogel.qqdl.site"
-	endpointBlacklistDur = 5 * time.Minute
+	tidalHifiAPIBase = "https://vogel.qqdl.site"
 )
 
 // defaultTidalHifiEndpoints is the built-in list of Tidal HiFi proxy endpoints.
@@ -31,6 +30,8 @@ var defaultTidalHifiEndpoints = []string{
 	"https://hifi-two.spotisaver.net",
 	"https://vogel.qqdl.site",
 	"https://triton.squid.wtf",
+	"https://maus.qqdl.site",
+	"https://hund.qqdl.site",
 }
 
 // defaultMetadataEndpoints are hifi-api v2.4 proxy endpoints that support
@@ -43,19 +44,11 @@ var defaultMetadataEndpoints = []string{
 	"https://triton.squid.wtf",
 }
 
-// endpointEntry tracks availability of a single API endpoint.
-type endpointEntry struct {
-	url         string
-	blacklisted bool
-	blacklistAt time.Time
-}
-
 // TidalHifiService implements FLAC downloading via a pool of proxy endpoints
 type TidalHifiService struct {
-	client           *http.Client
+	pool             *EndpointPool
+	parallel         bool
 	downloadClient   *http.Client // Separate client for downloads (no timeout)
-	endpoints        []*endpointEntry
-	endpointMu       sync.Mutex
 	options          DownloadOptions
 	logger           *LogBuffer // optional — set via SetLogger
 	downloadProgress func(written, total int64) // optional byte-level progress callback
@@ -80,14 +73,6 @@ func (pw *downloadProgressWriter) Write(p []byte) (int, error) {
 		}
 	}
 	return n, err
-}
-
-// TidalManifest represents the decoded manifest from hifi-api
-type TidalManifest struct {
-	MimeType       string   `json:"mimeType"`
-	Codecs         string   `json:"codecs"`
-	EncryptionType string   `json:"encryptionType"`
-	URLs           []string `json:"urls"`
 }
 
 // TidalHifiTrackResponse represents the track info response from vogel
@@ -146,9 +131,11 @@ type TidalStreamDataResponse struct {
 
 // StreamInfo contains information about the audio stream returned by Tidal
 type StreamInfo struct {
-	URL          string `json:"url"`
-	AudioQuality string `json:"audioQuality"` // HI_RES, LOSSLESS, HIGH, etc.
-	AudioMode    string `json:"audioMode"`    // STEREO, DOLBY_ATMOS, etc.
+	URL          string   `json:"url"`
+	URLs         []string `json:"urls,omitempty"`   // All segment URLs (for segmented streams)
+	Segmented    bool     `json:"segmented,omitempty"`
+	AudioQuality string   `json:"audioQuality"` // HI_RES, LOSSLESS, HIGH, etc.
+	AudioMode    string   `json:"audioMode"`    // STEREO, DOLBY_ATMOS, etc.
 }
 
 // DownloadResult represents the result of a download
@@ -205,9 +192,8 @@ func NewTidalHifiService() *TidalHifiService {
 	}
 
 	svc := &TidalHifiService{
-		client: &http.Client{
-			Timeout: 30 * time.Second, // For API calls only
-		},
+		pool:     NewEndpointPool(defaultTidalHifiEndpoints, 5*time.Minute),
+		parallel: true,
 		downloadClient: &http.Client{
 			Timeout:   0, // No timeout for downloads
 			Transport: downloadTransport,
@@ -220,13 +206,13 @@ func NewTidalHifiService() *TidalHifiService {
 			SaveCoverFile:   true,
 		},
 	}
-	svc.initEndpoints(nil) // uses defaultTidalHifiEndpoints
 	return svc
 }
 
 // SetLogger attaches a log buffer so endpoint rotation events are visible in the Terminal page.
 func (t *TidalHifiService) SetLogger(logger *LogBuffer) {
 	t.logger = logger
+	t.pool.SetLogger(logger)
 }
 
 // SetProxy configures both API and download HTTP clients to use the given proxy.
@@ -237,10 +223,11 @@ func (t *TidalHifiService) SetProxy(proxyURLStr string) error {
 	if err != nil {
 		return err
 	}
-	t.client = &http.Client{
+	apiClient := &http.Client{
 		Timeout:   30 * time.Second,
 		Transport: transport,
 	}
+	t.pool.SetClient(apiClient)
 	t.downloadClient = &http.Client{
 		Timeout:   0,
 		Transport: transport,
@@ -248,125 +235,34 @@ func (t *TidalHifiService) SetProxy(proxyURLStr string) error {
 	return nil
 }
 
+// SetParallel controls whether the endpoint pool races all endpoints in parallel.
+func (t *TidalHifiService) SetParallel(parallel bool) {
+	t.parallel = parallel
+}
+
 // SetEndpoints replaces the endpoint pool with a custom list (e.g. from config).
 // An empty/nil slice reverts to the built-in defaults.
 func (t *TidalHifiService) SetEndpoints(urls []string) {
-	t.initEndpoints(urls)
-}
-
-// initEndpoints (re)initialises the endpoint pool.
-func (t *TidalHifiService) initEndpoints(urls []string) {
 	if len(urls) == 0 {
 		urls = defaultTidalHifiEndpoints
 	}
-	t.endpointMu.Lock()
-	defer t.endpointMu.Unlock()
-	t.endpoints = make([]*endpointEntry, len(urls))
-	for i, u := range urls {
-		t.endpoints[i] = &endpointEntry{url: u}
-	}
+	t.pool.SetEndpoints(urls)
 }
 
-// getOrderedEndpoints returns endpoint URLs to try: non-blacklisted first,
-// then expired blacklists. Must be called with endpointMu held.
-func (t *TidalHifiService) getOrderedEndpoints() []string {
-	now := time.Now()
-	active := []string{}
-	expired := []string{}
-	for _, ep := range t.endpoints {
-		if !ep.blacklisted {
-			active = append(active, ep.url)
-		} else if now.After(ep.blacklistAt.Add(endpointBlacklistDur)) {
-			// Blacklist has expired — treat as available again
-			ep.blacklisted = false
-			active = append(active, ep.url)
-		} else {
-			expired = append(expired, ep.url)
-		}
-	}
-	// Return active first, then still-blacklisted as final fallback
-	return append(active, expired...)
-}
-
-// blacklistEndpoint marks an endpoint as temporarily unavailable.
-func (t *TidalHifiService) blacklistEndpoint(rawURL string) {
-	t.endpointMu.Lock()
-	defer t.endpointMu.Unlock()
-	for _, ep := range t.endpoints {
-		if ep.url == rawURL {
-			ep.blacklisted = true
-			ep.blacklistAt = time.Now()
-			return
-		}
-	}
-}
-
-// selectEndpoint returns the first usable endpoint URL.
-func (t *TidalHifiService) selectEndpoint() string {
-	t.endpointMu.Lock()
-	defer t.endpointMu.Unlock()
-	ordered := t.getOrderedEndpoints()
-	if len(ordered) > 0 {
-		return ordered[0]
-	}
-	return tidalHifiAPIBase
-}
-
-// tryAPIRequest performs a single GET request against one endpoint+path.
-func (t *TidalHifiService) tryAPIRequest(endpoint, path string) ([]byte, error) {
-	req, err := http.NewRequest("GET", endpoint+path, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-
-	resp, err := t.client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 500 {
-		return nil, fmt.Errorf("server returned %d", resp.StatusCode)
-	}
-
-	return io.ReadAll(resp.Body)
-}
-
-// makeAPIRequest tries each endpoint in rotation until one succeeds.
-// Failing endpoints are temporarily blacklisted for endpointBlacklistDur.
+// makeAPIRequest tries endpoints via the pool until one succeeds.
 func (t *TidalHifiService) makeAPIRequest(path string) ([]byte, error) {
-	t.endpointMu.Lock()
-	toTry := t.getOrderedEndpoints()
-	t.endpointMu.Unlock()
-
-	if len(toTry) == 0 {
-		toTry = []string{tidalHifiAPIBase}
+	ctx := context.Background()
+	var result *PoolResult
+	var err error
+	if t.parallel {
+		result, err = t.pool.RaceRequest(ctx, path)
+	} else {
+		result, err = t.pool.SequentialRequest(ctx, path)
 	}
-
-	var lastErr error
-	var prevEndpoint string
-
-	for _, endpoint := range toTry {
-		body, err := t.tryAPIRequest(endpoint, path)
-		if err == nil {
-			return body, nil
-		}
-
-		lastErr = err
-		t.blacklistEndpoint(endpoint)
-
-		if t.logger != nil {
-			if prevEndpoint != "" {
-				t.logger.Warn(fmt.Sprintf("switching Tidal endpoint: %s → %s (reason: %v)", prevEndpoint, endpoint, err))
-			} else {
-				t.logger.Warn(fmt.Sprintf("Tidal endpoint %s failed: %v", endpoint, err))
-			}
-		}
-		prevEndpoint = endpoint
+	if err != nil {
+		return nil, fmt.Errorf("all Tidal endpoints failed: %w", err)
 	}
-
-	return nil, fmt.Errorf("all Tidal endpoints failed: %v", lastErr)
+	return result.Body, nil
 }
 
 // SetOptions updates download options
@@ -381,13 +277,14 @@ func (t *TidalHifiService) GetOptions() DownloadOptions {
 
 // IsAvailable checks if the service is reachable
 func (t *TidalHifiService) IsAvailable() bool {
-	endpoint := t.selectEndpoint()
-	resp, err := t.client.Head(endpoint)
-	if err != nil {
-		return false
+	healthy := t.pool.GetHealthy()
+	if len(healthy) == 0 {
+		healthy = []string{tidalHifiAPIBase}
 	}
-	defer resp.Body.Close()
-	return resp.StatusCode < 500
+	// Use the pool's own client via a lightweight HEAD on the first healthy endpoint
+	ctx := context.Background()
+	result, err := t.pool.SequentialRequest(ctx, "/")
+	return err == nil && result != nil
 }
 
 // GetTrackAsTidalTrack fetches track info by Tidal ID and returns a TidalTrack.
@@ -506,20 +403,15 @@ func (t *TidalHifiService) parseStreamBody(body []byte, quality string, trackID 
 		return nil, fmt.Errorf("failed to decode manifest: %w", err)
 	}
 
-	var manifest TidalManifest
-	if err := json.Unmarshal(manifestBytes, &manifest); err != nil {
-		if len(manifestBytes) > 0 && manifestBytes[0] == '<' {
-			return nil, fmt.Errorf("quality %s unavailable for track %d (endpoint returned HTML instead of manifest)", quality, trackID)
-		}
-		return nil, fmt.Errorf("failed to parse manifest: %w", err)
-	}
-
-	if len(manifest.URLs) == 0 {
-		return nil, fmt.Errorf("no download URLs in manifest for quality %s", quality)
+	manifest, err := ParseManifest(manifestBytes)
+	if err != nil {
+		return nil, fmt.Errorf("quality %s unavailable for track %d: %w", quality, trackID, err)
 	}
 
 	return &StreamInfo{
 		URL:          manifest.URLs[0],
+		URLs:         manifest.URLs,
+		Segmented:    manifest.Segmented,
 		AudioQuality: audioQuality,
 		AudioMode:    audioMode,
 	}, nil
@@ -536,11 +428,10 @@ func (t *TidalHifiService) getStreamURLForQuality(trackID int, quality string) (
 	}
 
 	path := fmt.Sprintf("/track/?id=%d&quality=%s", trackID, quality)
+	ctx := context.Background()
+	client := t.pool.GetClient()
 
-	t.endpointMu.Lock()
-	toTry := t.getOrderedEndpoints()
-	t.endpointMu.Unlock()
-
+	toTry := t.pool.GetAvailable()
 	if len(toTry) == 0 {
 		toTry = []string{tidalHifiAPIBase}
 	}
@@ -549,10 +440,10 @@ func (t *TidalHifiService) getStreamURLForQuality(trackID int, quality string) (
 	var lastErr error
 
 	for _, endpoint := range toTry {
-		body, err := t.tryAPIRequest(endpoint, path)
+		body, err := singleEndpointRequest(ctx, client, endpoint, path)
 		if err != nil {
 			lastErr = err
-			t.blacklistEndpoint(endpoint)
+			t.pool.Blacklist(endpoint)
 			if t.logger != nil {
 				t.logger.Warn(fmt.Sprintf("Tidal endpoint %s failed: %v", endpoint, err))
 			}
@@ -562,7 +453,7 @@ func (t *TidalHifiService) getStreamURLForQuality(trackID int, quality string) (
 		info, err := t.parseStreamBody(body, quality, trackID)
 		if err != nil {
 			lastErr = err
-			t.blacklistEndpoint(endpoint)
+			t.pool.Blacklist(endpoint)
 			continue
 		}
 
@@ -591,6 +482,27 @@ func (t *TidalHifiService) getStreamURLForQuality(trackID int, quality string) (
 	}
 
 	return nil, fmt.Errorf("stream request failed for quality %s: %v", quality, lastErr)
+}
+
+// singleEndpointRequest performs a single authenticated GET against one endpoint+path.
+func singleEndpointRequest(ctx context.Context, client *http.Client, endpoint, path string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", endpoint+path, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 500 {
+		return nil, fmt.Errorf("server returned %d", resp.StatusCode)
+	}
+
+	return io.ReadAll(resp.Body)
 }
 
 // getStreamURLWithFallback tries the configured quality first, then walks down
@@ -868,7 +780,7 @@ func (t *TidalHifiService) makeMetadataRequest(path string) ([]byte, error) {
 		}
 		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
 
-		resp, err := t.client.Do(req)
+		resp, err := t.pool.GetClient().Do(req)
 		if err != nil {
 			lastErr = fmt.Errorf("request to %s failed: %w", endpoint, err)
 			if t.logger != nil {
@@ -1430,9 +1342,17 @@ func (t *TidalHifiService) DownloadTrack(trackID int, outputDir string, copyrigh
 	}
 
 	// Download the FLAC file
-	if err := t.downloadFile(streamInfo.URL, outputPath); err != nil {
-		result.Error = fmt.Sprintf("download failed: %v", err)
-		return result, err
+	ctx := context.Background()
+	if streamInfo.Segmented && len(streamInfo.URLs) > 1 {
+		if err := DownloadSegmented(ctx, streamInfo.URLs, outputPath, t.downloadClient, nil); err != nil {
+			result.Error = fmt.Sprintf("segmented download failed: %v", err)
+			return result, err
+		}
+	} else {
+		if err := t.downloadFile(ctx, streamInfo.URL, outputPath); err != nil {
+			result.Error = fmt.Sprintf("download failed: %v", err)
+			return result, err
+		}
 	}
 
 	// Tag the file with metadata
@@ -1509,8 +1429,8 @@ func (t *TidalHifiService) DownloadTrack(trackID int, outputDir string, copyrigh
 	return result, nil
 }
 
-func (t *TidalHifiService) downloadFile(downloadURL, outputPath string) error {
-	req, err := http.NewRequest("GET", downloadURL, nil)
+func (t *TidalHifiService) downloadFile(ctx context.Context, downloadURL, outputPath string) error {
+	req, err := http.NewRequestWithContext(ctx, "GET", downloadURL, nil)
 	if err != nil {
 		return fmt.Errorf("failed to create download request: %w", err)
 	}

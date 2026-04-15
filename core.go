@@ -91,6 +91,7 @@ func NewCore(dataDir string) (*Core, error) {
 		c.downloader.SetEndpoints(config.TidalHifiEndpoints)
 		c.logBuffer.Info(fmt.Sprintf("Tidal HiFi endpoint pool: %d endpoints configured", len(config.TidalHifiEndpoints)))
 	}
+	c.downloader.SetParallel(config.ParallelEndpointRequests)
 
 	// Set download options
 	c.downloader.SetOptions(DownloadOptions{
@@ -125,13 +126,33 @@ func NewCore(dataDir string) (*Core, error) {
 	if config.QobuzAuthToken != "" {
 		c.qobuzSource.SetCredentials(config.QobuzAppID, config.QobuzAppSecret, config.QobuzAuthToken)
 	}
+	if len(config.QobuzProxyEndpoints) > 0 {
+		c.qobuzSource.SetProxyEndpoints(config.QobuzProxyEndpoints)
+		c.logBuffer.Info(fmt.Sprintf("Qobuz proxy pool: %d endpoints configured", len(config.QobuzProxyEndpoints)))
+	}
 
 	c.downloadManager.SetFallbackQobuzSource(c.qobuzSource)
 
 	c.sourceManager = NewSourceManager()
 	c.sourceManager.RegisterSource(c.tidalSource)
 	c.sourceManager.RegisterSource(c.qobuzSource)
+
+	// Initialize Amazon source
+	amazonSource := NewAmazonSource()
+	if len(config.AmazonProxyEndpoints) > 0 {
+		amazonSource.pool.SetEndpoints(config.AmazonProxyEndpoints)
+		c.logBuffer.Info(fmt.Sprintf("Amazon proxy pool: %d endpoints configured", len(config.AmazonProxyEndpoints)))
+	}
+	if config.AmazonEnabled {
+		c.sourceManager.RegisterSource(amazonSource)
+	}
+
 	c.sourceManager.SetPreferredSource(config.PreferredSource)
+
+	// Apply source order; default to ["tidal","qobuz","amazon"] if unset
+	if len(config.SourceOrder) == 0 {
+		config.SourceOrder = []string{"tidal", "qobuz", "amazon"}
+	}
 
 	// Initialize extension manager
 	c.extensionManager = NewExtensionManager(GetDataDir(), c.logBuffer)

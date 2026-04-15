@@ -1,6 +1,7 @@
 package core
 
 import (
+	"context"
 	"crypto/md5"
 	"encoding/hex"
 	"encoding/json"
@@ -28,6 +29,20 @@ var defaultQobuzEndpoints = []string{
 	"https://www.qobuz.com/api.json/0.2",
 }
 
+// defaultQobuzProxyEndpoints are credential-free community proxy endpoints.
+var defaultQobuzProxyEndpoints = []string{
+	"https://dab.yeet.su/api/stream",
+	"https://dabmusic.xyz/api/stream",
+	"https://qobuz.squid.wtf/api/download-music",
+}
+
+// qobuzProxyQualityMap maps quality names to proxy format IDs.
+var qobuzProxyQualityMap = map[string]string{
+	"HI_RES":  "27",
+	"LOSSLESS": "7",
+	"HIGH":     "6",
+}
+
 // qobuzEndpointEntry tracks availability of a single Qobuz API endpoint.
 type qobuzEndpointEntry struct {
 	url         string
@@ -44,6 +59,7 @@ type QobuzSource struct {
 	available     bool
 	endpoints     []*qobuzEndpointEntry
 	endpointMu    sync.Mutex
+	proxyPool     *EndpointPool
 	logger        *LogBuffer // optional
 }
 
@@ -140,6 +156,7 @@ func NewQobuzSource(appID, appSecret string) *QobuzSource {
 		appID:     appID,
 		appSecret: appSecret,
 		available: appID != "" && appSecret != "",
+		proxyPool: NewEndpointPool(defaultQobuzProxyEndpoints, 5*time.Minute),
 	}
 	q.initEndpoints(nil)
 	return q
@@ -154,6 +171,15 @@ func (q *QobuzSource) SetLogger(logger *LogBuffer) {
 // An empty/nil slice reverts to the built-in defaults.
 func (q *QobuzSource) SetEndpoints(urls []string) {
 	q.initEndpoints(urls)
+}
+
+// SetProxyEndpoints replaces the credential-free proxy pool with a custom list.
+// An empty/nil slice reverts to the built-in defaults.
+func (q *QobuzSource) SetProxyEndpoints(urls []string) {
+	if len(urls) == 0 {
+		urls = defaultQobuzProxyEndpoints
+	}
+	q.proxyPool.SetEndpoints(urls)
 }
 
 // SetProxy configures the Qobuz HTTP client to use the given proxy URL.
@@ -314,9 +340,9 @@ func (q *QobuzSource) DisplayName() string {
 	return "Qobuz"
 }
 
-// IsAvailable checks if the source is configured
+// IsAvailable checks if the source is configured or proxy endpoints are healthy.
 func (q *QobuzSource) IsAvailable() bool {
-	return q.available && q.appID != ""
+	return (q.available && q.appID != "") || len(q.proxyPool.GetHealthy()) > 0
 }
 
 // SetCredentials updates Qobuz credentials
@@ -505,10 +531,38 @@ func (q *QobuzSource) GetPlaylist(id string) (*SourcePlaylist, error) {
 	}, nil
 }
 
-// GetStreamURL gets the download URL for a track
+// getStreamURLViaProxy fetches a stream URL from the community proxy endpoints.
+// No credentials are required; the proxy handles authentication.
+func (q *QobuzSource) getStreamURLViaProxy(ctx context.Context, trackID, quality string) (string, error) {
+	qid, ok := qobuzProxyQualityMap[quality]
+	if !ok {
+		qid = "7" // fallback to lossless
+	}
+	path := fmt.Sprintf("?trackId=%s&quality=%s", trackID, qid)
+	result, err := q.proxyPool.RaceRequest(ctx, path)
+	if err != nil {
+		return "", fmt.Errorf("qobuz proxy: %w", err)
+	}
+	// Parse the stream URL from the JSON response body.
+	// The "url" field name may differ across proxy implementations; adjust if needed.
+	var resp struct {
+		URL string `json:"url"`
+	}
+	if err := json.Unmarshal(result.Body, &resp); err != nil {
+		return "", fmt.Errorf("qobuz proxy parse: %w", err)
+	}
+	if resp.URL == "" {
+		return "", fmt.Errorf("qobuz proxy: empty URL in response")
+	}
+	return resp.URL, nil
+}
+
+// GetStreamURL gets the download URL for a track.
+// When userAuthToken is set, uses the official Qobuz API.
+// Otherwise falls back to credential-free community proxy endpoints.
 func (q *QobuzSource) GetStreamURL(trackID string, quality string) (string, error) {
 	if q.userAuthToken == "" {
-		return "", fmt.Errorf("Qobuz user authentication required for streaming")
+		return q.getStreamURLViaProxy(context.Background(), trackID, quality)
 	}
 
 	// Format ID: 27 = FLAC 24-bit up to 192kHz, 7 = FLAC 16-bit 44.1kHz, 6 = 320kbps MP3
@@ -587,6 +641,8 @@ func (q *QobuzSource) DownloadTrack(trackID string, outputDir string, options Do
 	// Copy data
 	size, err := io.Copy(file, resp.Body)
 	if err != nil {
+		file.Close()
+		os.Remove(filepath)
 		return nil, fmt.Errorf("failed to write file: %w", err)
 	}
 

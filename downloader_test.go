@@ -238,8 +238,8 @@ func TestTidalManifestStruct(t *testing.T) {
 		"urls": ["https://example.com/track.flac"]
 	}`
 
-	var manifest TidalManifest
-	if err := json.Unmarshal([]byte(jsonStr), &manifest); err != nil {
+	manifest, err := ParseManifest([]byte(jsonStr))
+	if err != nil {
 		t.Fatalf("Failed to parse manifest: %v", err)
 	}
 
