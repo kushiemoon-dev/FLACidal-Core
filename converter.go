@@ -86,6 +86,13 @@ var ConversionFormats = []ConversionFormat{
 		Qualities:   []string{"pcm"},
 		Description: "Uncompressed audio",
 	},
+	{
+		ID:        "flac",
+		Name:      "FLAC",
+		Extension: ".flac",
+		Qualities: []string{"192000:24", "96000:24", "88200:24", "48000:24", "44100:16"},
+		Description: "Lossless resampling (e.g. upsample to 96kHz/24bit)",
+	},
 }
 
 // NewConverter creates a new Converter instance
@@ -188,9 +195,14 @@ func (c *Converter) Convert(sourcePath string, opts ConversionOptions) (*Convers
 		return result, nil
 	}
 
-	// Build output filename
+	// Build output filename — for FLAC→FLAC resample, append quality suffix
+	// to avoid colliding with the source file.
 	baseName := strings.TrimSuffix(filepath.Base(sourcePath), filepath.Ext(sourcePath))
-	outputPath := filepath.Join(outputDir, baseName+format.Extension)
+	suffix := ""
+	if opts.Format == "flac" && filepath.Ext(sourcePath) == ".flac" {
+		suffix = "_" + strings.ReplaceAll(opts.Quality, ":", "_")
+	}
+	outputPath := filepath.Join(outputDir, baseName+suffix+format.Extension)
 	result.OutputPath = outputPath
 
 	// Check if output already exists
@@ -236,6 +248,19 @@ func (c *Converter) Convert(sourcePath string, opts ConversionOptions) (*Convers
 		args = append(args, "-codec:a", "alac")
 	case "wav":
 		args = append(args, "-codec:a", "pcm_s16le")
+	case "flac":
+		// Quality format: "sampleRate:bitDepth" e.g. "96000:24"
+		args = append(args, "-codec:a", "flac")
+		parts := strings.SplitN(opts.Quality, ":", 2)
+		if len(parts) == 2 {
+			args = append(args, "-ar", parts[0])
+			switch parts[1] {
+			case "24":
+				args = append(args, "-sample_fmt", "s32")
+			default:
+				args = append(args, "-sample_fmt", "s16")
+			}
+		}
 	}
 
 	// Add output path
